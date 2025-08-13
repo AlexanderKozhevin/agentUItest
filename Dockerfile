@@ -1,55 +1,59 @@
-# Use Node.js LTS (Alpine for smaller image size)
-FROM node:20-alpine AS base
+# syntax=docker/dockerfile:1
 
-# Install pnpm
-RUN corepack enable && corepack prepare pnpm@latest --activate
+ARG NODE_VERSION=20-alpine
 
-# Set working directory
+# Базовый слой
+FROM node:${NODE_VERSION} AS base
 WORKDIR /app
+ENV NODE_ENV=production \
+    NEXT_TELEMETRY_DISABLED=1
 
-# Install dependencies only when needed
+# ---- deps: установка зависимостей (кешируем store pnpm) ----
 FROM base AS deps
+# libc6-compat — частая зависимость бинарных пакетов; toolchain — на случай нативных модулей
+RUN apk add --no-cache libc6-compat python3 make g++
+# pnpm через corepack (не тянем глобально npm i -g)
+RUN corepack enable && corepack prepare pnpm@9.12.3 --activate
 COPY package.json pnpm-lock.yaml* ./
-RUN pnpm install --frozen-lockfile
+# Загружаем зависимости в кеш pnpm store без установки в node_modules
+RUN pnpm fetch --silent
 
-# Rebuild the source code only when needed
+# ---- builder: сборка Next.js ----
 FROM base AS builder
-COPY --from=deps /app/node_modules ./node_modules
+RUN apk add --no-cache libc6-compat \
+ && corepack enable && corepack prepare pnpm@9.12.3 --activate
+
+# Переносим кешированный store для оффлайн-установки
+COPY --from=deps /root/.local/share/pnpm/store /root/.local/share/pnpm/store
+COPY package.json pnpm-lock.yaml* ./
+RUN pnpm install --frozen-lockfile --offline
+
+# Копируем код и билдим
 COPY . .
-
-# Next.js collects completely anonymous telemetry data about general usage.
-# Learn more here: https://nextjs.org/telemetry
-# Uncomment the following line to disable telemetry during the build.
 ENV NEXT_TELEMETRY_DISABLED=1
+RUN pnpm run build
 
-RUN pnpm build
-
-# Production image, copy all the files and run next
-FROM base AS runner
+# ---- runner: минимальный образ для запуска ----
+FROM node:${NODE_VERSION} AS runner
 WORKDIR /app
 
-ENV NODE_ENV=production
-ENV NEXT_TELEMETRY_DISABLED=1
+ENV NODE_ENV=production \
+    PORT=3000 \
+    HOSTNAME=0.0.0.0 \
+    NEXT_TELEMETRY_DISABLED=1
 
-RUN addgroup --system --gid 1001 nodejs
-RUN adduser --system --uid 1001 nextjs
+# Непривилегированный пользователь
+RUN addgroup -g 1001 -S nodejs && adduser -S nextjs -u 1001
 
-# Ensure public directory exists to avoid COPY errors
-RUN mkdir -p public
-
-# Set the correct permission for prerender cache
-RUN mkdir .next
-RUN chown nextjs:nodejs .next
-
-# Copy built files
-COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
-COPY --from=builder --chown=nextjs:nodejs /app/public ./public
+# Копируем standalone-артефакты
+# .next/standalone содержит server.js и минимальные node_modules для рантайма
+COPY --from=builder /app/.next/standalone ./
+# статика и public ресурсы
+COPY --from=builder /app/.next/static ./.next/static
+COPY --from=builder /app/public ./public
 
 USER nextjs
-
 EXPOSE 3000
 
-ENV PORT=3000
-ENV HOSTNAME="0.0.0.0"
-
+# next start нам не нужен — standalone кладёт server.js
 CMD ["node", "server.js"]
