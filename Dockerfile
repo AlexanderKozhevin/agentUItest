@@ -1,55 +1,35 @@
-# syntax=docker/dockerfile:1
+# Stage 1: Dependency Installation & Build
+FROM node:20-alpine AS builder
 
-ARG NODE_VERSION=20-alpine
-
-# ---- base ----
-FROM node:${NODE_VERSION} AS base
 WORKDIR /app
-ENV NEXT_TELEMETRY_DISABLED=1
 
-# ---- deps (кешируем store) ----
-FROM base AS deps
-RUN apk add --no-cache libc6-compat python3 make g++
-RUN corepack enable && corepack prepare pnpm@9.12.3 --activate
-COPY package.json pnpm-lock.yaml* ./
-RUN pnpm fetch --silent
+# Copy package.json and package-lock.json first to leverage Docker cache
+COPY package.json package-lock.json ./
 
-# ---- builder (нужно devDeps!) ----
-FROM base AS builder
-# ВАЖНО: не production, чтобы ставились devDeps
-ENV NODE_ENV=development
-RUN apk add --no-cache libc6-compat \
-  && corepack enable && corepack prepare pnpm@9.12.3 --activate
+# Install dependencies
+RUN npm ci
 
-# перенесём кешированный store
-COPY --from=deps /root/.local/share/pnpm/store /root/.local/share/pnpm/store
-COPY package.json pnpm-lock.yaml* ./
-
-# ставим все зависимости (включая dev)
-RUN pnpm install --frozen-lockfile --offline --prod=false
-
-# копируем исходники и билдим
+# Copy the rest of the application code
 COPY . .
-# убедись, что в next.config.ts есть: export default { output: 'standalone' }
-RUN pnpm run build
 
-# ---- runner (минимальный рантайм) ----
-FROM node:${NODE_VERSION} AS runner
+# Build the Next.js application
+RUN npm run build
+
+# Stage 2: Production Image
+FROM node:20-alpine AS runner
+
 WORKDIR /app
 
-ENV NODE_ENV=production \
-    PORT=3000 \
-    HOSTNAME=0.0.0.0 \
-    NEXT_TELEMETRY_DISABLED=1
+# Set Node environment to production
+ENV NODE_ENV production
 
-# непривилегированный пользователь
-RUN addgroup -g 1001 -S nodejs && adduser -S nextjs -u 1001
-
-# standalone + статика + public
+# Copy only the necessary build output and node_modules from the builder stage
 COPY --from=builder /app/.next/standalone ./
-COPY --from=builder /app/.next/static ./.next/static
+COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/public ./public
 
-USER nextjs
+# Expose the port Next.js runs on (default is 3000)
 EXPOSE 3000
+
+# Command to start the Next.js application in production
 CMD ["node", "server.js"]
