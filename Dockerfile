@@ -1,35 +1,23 @@
-# Stage 1: Dependency Installation & Build
-FROM node:20-alpine AS builder
+FROM node:24-alpine3.21 AS base
 
+ENV PNPM_HOME="/pnpm"
+ENV PATH="$PNPM_HOME:$PATH"
+RUN apk --no-cache add git
+RUN corepack enable
+RUN git clone https://github.com/agno-agi/agent-ui.git /app
 WORKDIR /app
 
-# Copy package.json and package-lock.json first to leverage Docker cache
-COPY package.json
+FROM base AS deps
+RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --prod --frozen-lockfile
 
-# Install dependencies
-RUN npm install
+FROM base AS build
+RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile
+RUN pnpm run build
 
-# Copy the rest of the application code
-COPY . .
-
-# Build the Next.js application
-RUN npm run build
-
-# Stage 2: Production Image
-FROM node:20-alpine AS runner
-
-WORKDIR /app
-
-# Set Node environment to production
-ENV NODE_ENV production
-
-# Copy only the necessary build output and node_modules from the builder stage
-COPY --from=builder /app/.next/standalone ./
-COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/public ./public
-
-# Expose the port Next.js runs on (default is 3000)
-EXPOSE 3000
-
-# Command to start the Next.js application in production
-CMD ["node", "server.js"]
+FROM base
+COPY --from=deps /app/node_modules /app/node_modules
+COPY --from=build /app/.next /app/.next
+COPY --from=build /app/package.json /app/package.json
+COPY --from=build /app/next.config.ts /app/next.config.ts
+EXPOSE 8000
+CMD ["node_modules/.bin/next", "start", "-p", "8000"]
